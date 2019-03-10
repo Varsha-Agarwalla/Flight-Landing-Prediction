@@ -1,0 +1,943 @@
+---
+title: "Flight Landing Overrun"
+author: "Varsha Agarwalla"
+output:
+  html_document:
+    self_contained: true
+    lightbox: true
+    gallery: false
+    highlight: tango
+    code_folding: show
+---
+
+##Predicting flight landings using GLM Models{.tabset .tabset-fade}
+
+### Introduction 
+
+Motivation: To reduce the risk of landing overrun.
+
+Goal: To study what factors and how they would impact the landing distance of a
+commercial flight. 
+
+### Packages Required
+
+```{r libraries, echo = TRUE, message = FALSE, warning = FALSE}
+library(tidyverse)  #to visualize, transform, input, tidy and join data
+library(dplyr)      #data wrangling
+library(stringr)    #string related functions
+library(kableExtra) #to create HTML Table
+library(DT)         #to preview the data sets
+library(lubridate)  #to apply the date functions
+library(xlsx)       #to load excel files
+library(ROCR)       #to use ROC curves
+library(faraway)    #to use the ilogit function
+library(nnet)       #to implement multinomial function
+```
+
+###Initial Data Analysis 
+
+Data has following columns - 
+```{r transactions, echo=TRUE, message=FALSE, warning=FALSE}
+text_tbl <- data.frame (
+  Variable = c("Aircraft", "Duration", "No_pasg", "speed_ground","speed_air","height", "pitch","distance"),
+  Description = c(
+    "make of an aircraft ",
+    "Duration of flight",
+    "no. of passengers ",
+     "ground speed  ",
+    "air speed ",
+    "height ",
+    "pitch angle ",
+    "flight duration between take-off and landing "
+  )
+)
+
+kable(text_tbl) %>%
+  kable_styling(full_width = F) %>%
+  column_spec(1, bold = T, border_right = T) %>%
+  column_spec(2, width = "30em")
+```
+
+
+#### Exploratory Data Analysis    
+
+I load the two datasets-     
+
+```{r dataload, message=FALSE, warning=FALSE}
+faa1 <- read.xlsx("FAA1.xls", sheetName = "FAA1")
+faa2 <- read.xlsx("FAA2_2.xls", sheetName = "Sheet1")
+
+```
+
+Data has `r nrow(faa1)` observations and `r ncol(faa1)` in FAA1.
+Data has `r nrow(faa2)` observations and `r ncol(faa2)` in FAA2.
+
+FAA2 doesn't contain information about the duration of flights
+
+Merge the two data sets. Are there any duplications?
+
+```{r}
+faa <- bind_rows(faa1, faa2)
+
+str(faa)
+```
+
+```{r}
+#add the duplicate removal code
+faa %>% 
+  select(-duration) %>% 
+  duplicated() %>% 
+  sum() 
+```
+
+There are 100 duplicated in total, which I have removed. 
+
+```{r}
+check <- faa %>%  
+ select(-duration) %>% 
+  duplicated() %>% 
+  which()
+
+faa <- faa[-check,]
+```
+
+
+Key findings- 
+
+I observed that few of the variables have incorrect data, which may be because of the issue with data capture or wrong data entry. For example-
+
+1. **height** has negative value as the minimum value
+
+2. the minimum **distance** for an observation is 34 which is too small.
+
+3. **air_speed** is not captured for 75% of the data.
+
+4. The minium **duration** of flight is 15 minutes, which doesn't seem right
+
+5. Data had duplicate records(100) after merging the two data-sets
+
+
+#### Data Cleaning and further exploration  
+
+Removing abnormal values in the data set.
+
+
+```{r}
+faa_check <- faa %>% 
+  filter((duration > 40| is.na(duration)) & (speed_ground >= 30) & (speed_ground <= 140) &
+           (height >= 6) & (distance < 6000)) 
+dim(faa_check)
+faa <- faa_check
+```
+
+A total of 19 observations seem abnormal which we remove. 
+
+Data has `r nrow(faa)` observations and `r ncol(faa)`
+
+We observe that Duration is null for 50 observations, which we need to look at. We will replace the value with mean of the overall column
+
+```{r}
+faa$duration_corrected <- NA
+faa <-  transform(faa, duration_corrected = ifelse(is.na(faa$duration), mean(faa$duration, na.rm=TRUE), faa$duration))
+
+```
+
+Plotting histogram for all the variables.
+
+```{r}
+#hist(faa$duration_impute, main = "Histogram of Duration", xlab = "Duration")
+hist(faa$speed_ground, main = "Histogram of Ground Speed", xlab = "Ground Speed")
+hist(faa$height, main = "Histogram of Height", xlab = "Height")
+hist(faa$pitch, main = "Histogram of Pitch", xlab = "Pitch")
+hist(faa$no_pasg, main = "Histogram of No. of Passengers", xlab = "No. of Passengers")
+hist(faa$speed_air, main = "Histogram of Air Speed", xlab = "Air Speed")
+hist(faa$distance, main = "Histogram of Landing Distance", xlab = "Landing Distance")
+hist(faa$duration_corrected, main = "Histogram of Duration of flight", xlab = "Flight Duration in mins")
+```
+
+Key findings:
+
+After cleaning the data, I observed that - 
+1. There were total 19 abnormal values in the data
+
+2. Duration has 50 NA values, which we corrected based on the mean of the overall sample
+
+3. Speed of the air is right-skewed whereas all the other variables seem to be noramlly distributed
+
+4. Min speed of air is 90 MPH
+
+#### Initial analysis for identifying important factors that impact the
+response variable “landing distance”
+  
+
+Pairwise Correlation
+
+```{r}
+cor_duration <- cor(faa$distance, faa$duration_corrected)
+cor_speed_ground <- cor(faa$distance,faa$speed_ground)
+cor_height <- cor(faa$distance,faa$height)
+cor_pitch <- cor(faa$distance,faa$pitch)
+cor_no_pasg <- cor(faa$distance,faa$no_pasg)
+cor_speed_air <- cor.test(faa$distance,faa$speed_air,method="pearson")$estimate
+cor_aircraft <- cor(faa$distance,as.numeric(faa$aircraft ))
+
+variable_names <- c("Duration","Ground Speed","Height","Pitch",
+                    "No. of Passengers","Air Speed","Aircraft")
+correlation <- c(cor_duration,cor_speed_ground,cor_height,cor_pitch,cor_no_pasg,cor_speed_air,cor_aircraft)
+
+table_1 <- data.frame(variable_names,correlation)
+
+table_1$direction <- ifelse(table_1$correlation > 0, "Positive","Negative")
+
+table_1 <- table_1 %>% arrange(desc(correlation))
+
+```
+
+Show X-Y scatter plots
+
+```{r message=FALSE, warning=FALSE}
+
+faa <- faa[-2]
+GGally::ggpairs(
+  data = faa
+)
+
+```
+
+
+#### Checking collinearity 
+
+
+We see that both air_speed and ground_speed are closely related to the landing distance. Since they are highly correlated, when we regress both the variables together, we see that ground_speed becomes insignificant as the variability due to speed_ground is explained by speed_Air and hence it is not contributing in explaining variation any more.
+
+```{r}
+
+cor.test(faa$speed_ground, faa$speed_air, method = "pearson")$estimate
+```
+
+We observe 98% correlation. 
+I would like to keep speed_air in my method because since R^2 and adj. R^2 is more when speed_air is considered.(comparison of the two models- 1 and 2.) Thus, speed of air is a significant contributor according to me.
+
+
+### Variable selection and Linear Regression  
+
+#####R squared vs No. of variables
+
+```{r}
+
+model0 <- lm(distance ~ 1,data=faa)
+model1 <- lm(distance ~ speed_air,data=faa)
+model2 <- lm(distance ~ speed_air + aircraft,data=faa)
+model3 <- lm(distance ~ speed_air + aircraft + height ,data=faa)
+model4 <- lm(distance ~ speed_air + aircraft + height + no_pasg  ,data=faa)
+model5 <- lm(distance ~ speed_air + aircraft + height + no_pasg + duration_corrected ,data=faa)
+model6 <- lm(distance ~ speed_air + aircraft + height + no_pasg + duration_corrected + pitch,data=faa)
+
+model0.rsqr <- summary(model0)$r.squared
+model1.rsqr <- summary(model1)$r.squared
+model2.rsqr <- summary(model2)$r.squared
+model3.rsqr <- summary(model3)$r.squared
+model4.rsqr <- summary(model4)$r.squared
+model5.rsqr <- summary(model5)$r.squared
+model6.rsqr <- summary(model6)$r.squared
+
+rsquare <- cbind(c(model0.rsqr, model1.rsqr, model2.rsqr, model3.rsqr, model4.rsqr, model5.rsqr, model6.rsqr), 0:6) 
+
+ colnames(rsquare) <- c("rsquare","variables") 
+
+ rsquare <-  as.data.frame(rsquare)
+ 
+ rsquare %>% 
+   ggplot(aes(x = variables, y = rsquare)) + 
+   geom_line() + 
+   xlab("no. of variables") +
+   ylab("R-square") +
+   theme_classic()
+  
+```
+
+
+With increase in variables, R^2 also increases. 
+
+
+##### Adjusted R^2 vs No. of variables
+
+```{r}
+
+model0.rsqr <- summary(model0)$adj.r.squared
+model1.rsqr <- summary(model1)$adj.r.squared
+model2.rsqr <- summary(model2)$adj.r.squared
+model3.rsqr <- summary(model3)$adj.r.squared
+model4.rsqr <- summary(model4)$adj.r.squared
+model5.rsqr <- summary(model5)$adj.r.squared
+model6.rsqr <- summary(model6)$adj.r.squared
+
+rsquare <- cbind(c(model0.rsqr, model1.rsqr, model2.rsqr, model3.rsqr, model4.rsqr, model5.rsqr, model6.rsqr), 0:6) 
+
+ colnames(rsquare) <- c("adj_rsquare","variables") 
+
+ rsquare <-  as.data.frame(rsquare)
+ 
+ rsquare %>% 
+   ggplot(aes(x = variables, y = adj_rsquare)) + 
+   geom_line() + 
+   xlab("no. of variables") +
+   ylab("Adjusted R-square") +
+   theme_classic()
+
+
+```
+
+We see that Adjusted R^2 increases initially but then it slowly starts declining after 3 variables have been added.
+
+##### Model with AIC values
+
+```{r}
+model0_AIC <- AIC(model0)
+model1_AIC <- AIC(model1)
+model2_AIC <- AIC(model2)
+model3_AIC <- AIC(model3)
+model4_AIC <- AIC(model4)
+model5_AIC <- AIC(model5)
+model6_AIC <- AIC(model6)
+
+AIC <- cbind(c(model0_AIC, model1_AIC, model2_AIC, model3_AIC, model4_AIC, model5_AIC, model6_AIC),0:6)
+
+colnames(AIC) <- c("AIC","variables")
+
+AIC <- as.data.frame(AIC)
+
+AIC %>% 
+  ggplot(aes(x = variables, y = AIC)) +
+  geom_line() +
+  xlab("no. of variables")+
+  ylab("AIC") +
+  theme_classic()
+```
+
+since smaller the AIC, better is the model. Hence, we see that it decreases. However, after addition of 3 variables, the decrease in AIC isn't much and infact it starts going up. 
+
+##### Suitable model
+
+According to me, the significant model is - 
+
+```{r}
+model4 <- lm(distance ~ speed_air + aircraft + height ,data=faa)
+summary(model4)
+```
+
+The R^2 and Adjusted R^2 are also close and around 97% which is quite right.
+
+
+#### Variable selection based on automate algorithm
+
+
+```{r}
+
+faaNoNA <- na.exclude(faa)
+#nrow(faaNoNA)
+model01 <- lm(distance ~ 1,data=faaNoNA)
+model11 <- lm(distance ~ speed_air,data=faaNoNA)
+model21 <- lm(distance ~ speed_air + aircraft,data=faaNoNA)
+model31 <- lm(distance ~ speed_air + aircraft + height ,data=faaNoNA)
+model41 <- lm(distance ~ speed_air + aircraft + height + no_pasg  ,data=faaNoNA)
+model51 <- lm(distance ~ speed_air + aircraft + height + no_pasg + duration_corrected ,data=faaNoNA)
+model61 <- lm(distance ~ speed_air + aircraft + height + no_pasg + duration_corrected + pitch,data=faaNoNA)
+
+MASS::stepAIC(model01,direction="forward",scope=list(upper=model61,lower=model01))
+
+```
+
+I observe that number of passengers is also considered a signicant contributor by automatic selection of variables.
+
+so the final model as obtained here is - model4 i.e. 
+
+Distance = - 6263.754 + 82.032( speed_air) + 432.074 (aircraft) + 13.776(height) - 2.041(no_pasg)
+
+From this, we can also conclude that there is no single criteria for selecting a model. Also there is no **"best model"**. Since, we have chosen *AIC* as our selection criteria, we see no_pasg also included in our model. However, if I try to include this variable using *P_value* method, no_pasg will turn out to be non-significant. 
+
+
+### GLM(Logistic, Probit and CLoglog Models)
+
+Segregating long but non-risky landing distance from risky distance.
+
+```{r}
+
+faa <- faa %>% 
+  mutate(long.landing = as.factor(ifelse(distance > 2500, 1,0 )) , 
+         risky.landing  = as.factor(ifelse(distance > 3000,1,0 )),
+         aircraft = as.factor(aircraft))
+faa$duration <- NULL
+faa$distance <- NULL
+```
+
+Histogram to show distribution of "long.landing"
+
+```{r}
+faa %>% 
+  ggplot(aes(long.landing)) + 
+  geom_bar()
+```
+
+only 12% aircrafts have long landing
+```{r}
+round(prop.table(table(faa$long.landing)),2)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+mdl_duration <- glm (faa$long.landing ~ faa$duration_corrected, family = "binomial")
+mdl_speedgrnd <- glm (faa$long.landing ~ faa$speed_ground, family = "binomial")
+mdl_height <- glm (faa$long.landing ~ faa$height, family = "binomial")
+mdl_pitch <- glm (faa$long.landing ~ faa$pitch, family = "binomial")
+mdl_nopasg <- glm (faa$long.landing ~ faa$no_pasg, family = "binomial")
+mdl_speedair <- glm (faa$long.landing ~ faa$speed_air, family = "binomial")
+mdl_aircraft <- glm (faa$long.landing ~ faa$aircraft, family = "binomial")
+
+
+duration <- summary(mdl_duration)$coef[2,c(1,4)]
+speed_ground <- summary(mdl_speedgrnd)$coef[2,c(1,4)]
+height <- summary(mdl_height)$coef[2,c(1,4)]
+pitch <- summary(mdl_pitch)$coef[2,c(1,4)]
+no_pasg <- summary(mdl_nopasg)$coef[2,c(1,4)]
+speed_air <- summary(mdl_speedair)$coef[2,c(1,4)]
+aircraft_boeing <- summary(mdl_aircraft)$coef[2,c(1,4)]
+aircraft_airbus <- summary(mdl_aircraft)$coef[1,c(1,4)]
+
+coefficients <- c(duration[1], speed_ground[1], height[1], pitch[1], no_pasg[1],speed_air[1],aircraft_boeing[1],aircraft_airbus[1])
+coefficients <- round(coefficients, digits = 3)
+
+odds_ratio <- round(exp(coefficients), 3)
+
+p_value <- c(duration[2], speed_ground[2], height[2], pitch[2], no_pasg[2],speed_air[2],aircraft_boeing[2],aircraft_airbus[2]) 
+p_value <- round(p_value, digits = 3)
+
+variable_names <- c("Duration","Ground Speed","Height","Pitch","No. of Passengers","Air Speed","Aircraft-Boeing", "Aircraft-Airbus")
+
+table_2 <- data.frame(variable_names, coefficients,odds_ratio, p_value)
+table_2$slope_direction <- ifelse(coefficients > 0 , "Positive", "Negative")
+table_2 <- table_2 %>% 
+  select(variable_names, coefficients, odds_ratio, p_value, slope_direction) %>% 
+  arrange(p_value)
+
+table_2
+```
+
+
+we see speed_ground, speed_air, aircraft type, pitch and height appear to be positively correlated to long_landing.
+
+Let's visualize it - 
+
+```{r}
+check_plot <- function(x) {
+  ggplot(aes(x = x, fill = long.landing), data = faa) +
+    geom_histogram(position = 'dodge', aes(y = ..density..))
+}
+
+```
+
+The probability of long landing increases with the increase in speed_ground
+```{r message=FALSE, warning=FALSE}
+check_plot(faa$speed_ground)
+```
+
+
+Probability of long landing increases with increase in speed of air
+```{r message=FALSE, warning=FALSE}
+check_plot(faa$speed_air)
+```
+
+Long landing isn't affected by pitch of aircraft
+```{r message=FALSE, warning=FALSE}
+check_plot(faa$pitch)
+```
+
+Long landing seem to be unaffected by height of aircraft
+```{r message=FALSE, warning=FALSE}
+check_plot(faa$height)
+```
+
+
+I observed that speed of ground, aircraft and height are significant. Pitch is not significant like we observed in the previous table
+
+```{r message=FALSE, warning=FALSE}
+full_model <- glm(long.landing ~ aircraft + 
+                    no_pasg + speed_ground + height + 
+                    pitch  + duration_corrected, family = "binomial",
+                  data = faa)
+summary(full_model)
+```
+
+Based on AIC model, results seem to be consistent with the table observed.
+
+```{r message=FALSE, warning=FALSE}
+faa_clean <-  select(faa, -risky.landing , -speed_air)
+model01 <- glm(long.landing ~ 1,data=faa_clean, family = "binomial")
+model61 <- glm(long.landing ~ speed_ground + aircraft + height + no_pasg + duration_corrected + pitch,data=faa_clean, family = "binomial")
+model_1 <- MASS::stepAIC(model01,direction="forward",scope=list(upper=model61,lower=model01))
+```
+
+```{r}
+summary(model_1)
+```
+
+We further use BIC measure to find "best subsets" model. Pitch is not chosen by this model. This may be because BIC penalizes strongly 
+
+```{r message=FALSE, warning=FALSE}
+model_2 <- MASS::stepAIC(model01,direction="forward",scope=list(upper=model61,lower=model01), k = log(nrow(faa_clean)))
+summary(model_2)
+```
+
+The variables and their contribution in prediction of long landing is - 
+```{r}
+table_2
+```
+
+The various plots that helped us understand the relationship between the variables better- 
+
+The probability of long landing increases with the increase in speed_ground
+```{r message=FALSE, warning=FALSE}
+check_plot(faa$speed_ground)
+```
+
+
+Probability of long landing increases with increase in speed of air
+```{r message=FALSE, warning=FALSE}
+check_plot(faa$speed_air)
+```
+
+Long landing isn't affected by pitch of aircraft
+```{r message=FALSE, warning=FALSE}
+check_plot(faa$pitch)
+```
+
+Long landing seem to be unaffected by height of aircraft
+```{r message=FALSE, warning=FALSE}
+check_plot(faa$height)
+```
+
+Based on our analysis, our final model is: long.landing ~ speed_ground + aircraft + height
+
+
+####Risky Landing
+Repeating all the steps for risky landing--- 
+
+
+```{r message=FALSE, warning=FALSE}
+faa %>% 
+  ggplot(aes(risky.landing)) + 
+  geom_bar()
+```
+
+only 7% aircrafts have long landing
+```{r}
+round(prop.table(table(faa$risky.landing)),2)
+```
+
+The speed of ground, air speed and aircraft make seems to be likely to affect the risky landing.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+mdl_duration <- glm (faa$risky.landing ~ faa$duration_corrected, family = "binomial")
+mdl_speedgrnd <- glm (faa$risky.landing ~ faa$speed_ground, family = "binomial")
+mdl_height <- glm (faa$risky.landing ~ faa$height, family = "binomial")
+mdl_pitch <- glm (faa$risky.landing ~ faa$pitch, family = "binomial")
+mdl_nopasg <- glm (faa$risky.landing ~ faa$no_pasg, family = "binomial")
+mdl_speedair <- glm (faa$risky.landing ~ faa$speed_air, family = "binomial")
+mdl_aircraft <- glm (faa$risky.landing ~ faa$aircraft, family = "binomial")
+
+
+duration <- summary(mdl_duration)$coef[2,c(1,4)]
+speed_ground <- summary(mdl_speedgrnd)$coef[2,c(1,4)]
+height <- summary(mdl_height)$coef[2,c(1,4)]
+pitch <- summary(mdl_pitch)$coef[2,c(1,4)]
+no_pasg <- summary(mdl_nopasg)$coef[2,c(1,4)]
+speed_air <- summary(mdl_speedair)$coef[2,c(1,4)]
+aircraft_boeing <- summary(mdl_aircraft)$coef[2,c(1,4)]
+aircraft_airbus <- summary(mdl_aircraft)$coef[1,c(1,4)]
+
+coefficients <- c(duration[1], speed_ground[1], height[1], pitch[1], no_pasg[1],speed_air[1],aircraft_boeing[1],aircraft_airbus[1])
+coefficients <- round(coefficients, digits = 3)
+
+odds_ratio <- round(exp(coefficients), 3)
+
+p_value <- c(duration[2], speed_ground[2], height[2], pitch[2], no_pasg[2],speed_air[2],aircraft_boeing[2],aircraft_airbus[2]) 
+p_value <- round(p_value, digits = 3)
+
+variable_names <- c("Duration","Ground Speed","Height","Pitch","No. of Passengers","Air Speed","Aircraft-Boeing", "Aircraft-Airbus")
+
+table_2 <- data.frame(variable_names, coefficients,odds_ratio, p_value)
+table_2$slope_direction <- ifelse(coefficients > 0 , "Positive", "Negative")
+table_2 <- table_2 %>% 
+  select(variable_names, coefficients, odds_ratio, p_value, slope_direction) %>% 
+  arrange(p_value)
+
+table_2
+```
+
+
+we see speed_ground, speed_air, aircraft type, pitch and height appear to be positively correlated to long_landing.
+
+Let's visualize it - 
+
+```{r message=FALSE, warning=FALSE}
+check_plot_risky <- function(x) {
+  ggplot(aes(x = x, fill = risky.landing), data = faa) +
+    geom_histogram(position = 'dodge', aes(y = ..density..))
+}
+
+```
+
+The probability of riksy landing increases with the increase in speed_ground
+```{r message=FALSE, warning=FALSE}
+check_plot_risky(faa$speed_ground)
+```
+
+
+Probability of risky landing increases with increase in speed of air
+```{r message=FALSE, warning=FALSE}
+check_plot_risky(faa$speed_air)
+```
+
+Risky landing isn't affected by pitch of aircraft
+```{r message=FALSE, warning=FALSE}
+check_plot_risky(faa$pitch)
+```
+
+Risky landing seem to be unaffected by height of aircraft
+```{r message=FALSE, warning=FALSE}
+check_plot_risky(faa$height)
+```
+
+
+I observed that speed of ground and make of aircraft are significant. Results seem to be consistent with our observations before
+
+```{r message=FALSE, warning=FALSE}
+full_model <- glm(risky.landing ~ aircraft + 
+                    no_pasg + speed_ground + height + 
+                    pitch  + duration_corrected, family = "binomial",
+                  data = faa)
+summary(full_model)
+```
+
+
+Results seem to be inconsistent with our observation before. Based on AIC measure, number of passengers seems to be a significant variable whereas if we look at the p_value, it doesn't support our hypothesis.
+
+```{r message=FALSE, warning=FALSE}
+faa_clean2 <-  select(faa, -long.landing , -speed_air)
+model_null2 <- glm(risky.landing ~ 1,data=faa_clean2, family = "binomial")
+model_full2 <- glm(risky.landing ~ speed_ground + aircraft + height + no_pasg + duration_corrected + pitch,data=faa_clean2, family = "binomial")
+model_3 <- MASS::stepAIC(model_null2,direction="forward",scope=list(upper=model_full2,lower=model_null2))
+summary(model_3)
+```
+
+Number of passengers, which seemed to be significant when considering AIC as the method for variable selection seem to be not significant when considering BIC. This may be because BIC penalizes strongly 
+
+```{r message=FALSE, warning=FALSE}
+model_4 <- MASS::stepAIC(model_null2,direction="forward",scope=list(upper=model_full2,lower=model_null2), k = log(nrow(faa_clean2)))
+summary(model_4)
+```
+
+Conclusions for both the type of landings - 
+
+1. Speed of ground, height and type of aircraft are significant predictors of long landing.
+
+2. Only speed of ground and type of aircraft are significant predictors of risky landing and height of aircraft seems to be not playing a role when landing is risky.
+
+3. BIC for long landing is 65.047 and for risky landing is 46.097.
+
+4. AIC for long landing is 63.204 and for long landing is 45.707
+
+####Model Assessment
+
+ROC Curves:
+
+Plot for risky landing is marginally smoother than that for long landing.
+
+```{r message=FALSE, warning=FALSE}
+data1 <- select(faa, -risky.landing, -speed_air)
+data2 <- select(faa, -long.landing, -speed_air)
+
+pred1 <- prediction(predict(model_2), data1$long.landing)
+roc1 <- performance(pred1, "tpr", "fpr", main = "ROC for long landing and risky landing")
+plot(roc1)
+
+pred2 <- prediction(predict(model_4), data2$risky.landing)
+roc2 <- performance(pred2, "tpr", "fpr")
+plot(roc2, add = TRUE, colorize = TRUE, main = "ROC for long landing and risky landing")
+
+```
+
+
+The AUC in case of long landing is 99.6% and that for risky landing is 99.9%. 
+
+
+```{r message=FALSE, warning=FALSE}
+#long landing
+auc_ROCR1 <- performance(pred1, measure = "auc")
+ auc_ROCR1@y.values[[1]]
+``` 
+  
+```{r message=FALSE, warning=FALSE}
+ #risky landing 
+auc_ROCR2 <- performance(pred2, measure = "auc")
+auc_ROCR2@y.values[[1]]  
+
+```
+
+
+#### Prediction:
+
+Given few parameters, 
+
+- Aircraft = Boeing
+- Duration = 200
+- no_pasg = 80
+- speed_ground = 115
+- speed_air = 120
+- height = 40
+- pitch = 4
+
+The long landing probability - 
+```{r message=FALSE, warning=FALSE}
+
+new.ind <- data.frame(aircraft = "boeing", 
+                      duration_corrected = 200, 
+                      no_pasg = 80,
+                      speed_ground = 115, 
+                      speed_air = 120,
+                      height = 40,
+                      pitch = 4)
+
+pred1 <- predict(model_2,newdata=new.ind, type = "link", se = T)
+
+fit <- ilogit(pred1$fit)
+upper <- ilogit(pred1$fit + (1.96 * pred1$se.fit))
+lower <- ilogit(pred1$fit - (1.96 * pred1$se.fit))
+
+cat("The confidence interval for long landing-",lower,"||", fit, "||", upper)
+
+```
+
+
+The risky landing probability - 
+```{r message=FALSE, warning=FALSE}
+new.ind <- data.frame(aircraft = "boeing", 
+                      duration_corrected = 200, 
+                      no_pasg = 80,
+                      speed_ground = 115, 
+                      speed_air = 120,
+                      height = 40,
+                      pitch = 4)
+
+pred1 <- predict(model_4,newdata=new.ind,type = "link", se = T)
+
+fit <- ilogit(pred1$fit)
+upper <- ilogit(pred1$fit + (1.96 * pred1$se.fit))
+lower <- ilogit(pred1$fit - (1.96 * pred1$se.fit))
+
+cat("The confidence interval for risky landing-",lower,"||", fit, "||", upper)
+
+```
+
+####Other Link Functions
+
+Comparing models with different link functions
+
+1. The coefficients are greater for logit model
+
+2. The std. error is minimum  for probit model
+
+3. The slope direction is same for all the three models
+
+```{r message=FALSE, warning=FALSE}
+
+probit <- glm(risky.landing ~ aircraft+speed_ground, 
+                    family=binomial (link = "probit"),
+                    data=data2)
+
+cloglog <- glm(risky.landing ~ aircraft+speed_ground, 
+                    family=binomial (link = "cloglog"),
+                    data=data2)
+
+round(summary(model_4)$coefficients,3)
+
+round(summary(probit)$coefficients,3)
+
+round(summary(cloglog)$coefficients,3)
+
+```
+
+
+ROC curves for the three models
+
+```{r message=FALSE, warning=FALSE}
+par(mfrow=c(1,3))
+
+pred1 <- prediction(predict(model_4), data2$risky.landing)
+perf <- performance(pred1, "tpr", "fpr")
+plot(perf, main = "Logit Model")
+
+pred2 <- prediction(predict(probit), data2$risky.landing)
+perf <- performance(pred2, "tpr", "fpr")
+plot(perf, main = "Probit Model")
+
+pred3 <- prediction(predict(cloglog), data2$risky.landing)
+perf <- performance(pred3, "tpr", "fpr")
+plot(perf, main = "Cloglog Model")
+
+```
+
+AUC for the three are all same and it is 99%
+
+```{r}
+auc_logit <- performance(pred1, measure = "auc") 
+auc_logit <- auc_logit@y.values[[1]]  
+
+auc_probit <- performance(pred2, measure = "auc")
+auc_probit <- auc_probit@y.values[[1]]  
+
+auc_cloglog <- performance(pred3, measure = "auc")
+auc_cloglog <- auc_cloglog@y.values[[1]]  
+
+
+cat("AUC for logit is:",auc_logit," AUC for Probit is: ",
+  auc_probit, " AUC for Loglog is: ", auc_cloglog)
+```
+
+
+- Flight in observations 64 is appearing in all the three models and is risky.
+
+- Flight in observation 307 and 176 is appearing in two of the models and is also having a risky landing
+
+```{r}
+pred_logit <- predict(model_4, type = "response")
+pred_probit <- predict(probit, type = "response")
+pred_cloglog <- predict(cloglog, type = "response")
+
+
+head(sort(pred_logit, decreasing = T))
+head(sort(pred_probit, decreasing = T))
+head(sort(pred_cloglog, decreasing = T))
+```
+
+The probability of risky landing is asymmetric for all the three models. 
+
+```{r}
+
+cat("The confidence interval for logit:",lower,"||", fit, "||", upper)
+
+pred2 <- predict(probit, new.ind, type = "link", se.fit = TRUE)
+
+fit <- ilogit(pred2$fit)
+upper <- ilogit(pred2$fit + (1.96 * pred2$se.fit))
+lower <- ilogit(pred2$fit - (1.96 * pred2$se.fit))
+
+cat("The confidence interval for probit:",lower,"||", fit, "||", upper)
+
+
+pred3 <- predict(cloglog, new.ind, type = "link", se.fit = TRUE)
+
+fit <- ilogit(pred3$fit)
+upper <- ilogit(pred3$fit + (1.96 * pred3$se.fit))
+lower <- ilogit(pred3$fit - (1.96 * pred3$se.fit))
+
+cat("The confidence interval for cloglog:",lower,"||", fit, "||", upper)
+
+```
+
+### Multinomial Regression
+
+We will create a mulitnomial variabe for distance. 
+
+```{r dataload1, message=FALSE, warning=FALSE, include=FALSE}
+faa <- bind_rows(faa1, faa2)
+check <- faa %>%  
+ select(-duration) %>% 
+  duplicated() %>% 
+  which()
+
+faa <- faa[-check,]
+
+faa_check <- faa %>% 
+  filter((duration > 40| is.na(duration)) & (speed_ground >= 30) & (speed_ground <= 140) &
+           (height >= 6) & (distance < 6000)) 
+faa <- faa_check
+
+```
+
+```{r}
+faa1 <- faa %>% 
+  mutate(Y = (ifelse(distance < 1000, 1, 
+                     ifelse( distance >= 1000 & distance < 2000, 2, 3)) ))
+faa1$distance <- NULL
+
+```
+
+Now, we will use multinomial model to fit Y. We treat the new variable Y as categorical under the assumption that the levels of Y have no natural ordering.
+
+```{r}
+faa1$Y <- as.factor(faa1$Y)
+faa1 <-  select(faa1, -speed_air ) %>% 
+  na.omit()
+mmod <- multinom(Y ~ aircraft + duration +
+                   no_pasg + speed_ground + pitch + height , faa1)
+```
+
+Based on AIC, we get the model as - 
+
+```{r}
+mmodi <- step(mmod)
+summary(mmodi)
+```
+
+Now I want to see where the mean values lie for all the variables at different Y.
+
+```{r}
+duration <- tapply(faa1$duration, faa1$Y, mean, na.rm=TRUE)
+no_pasg <- tapply(faa1$no_pasg, faa1$Y, mean, na.rm=TRUE)
+speed_ground <- tapply(faa1$speed_ground, faa1$Y, mean, na.rm=TRUE)
+height <- tapply(faa1$height, faa1$Y, mean, na.rm=TRUE)
+pitch <- tapply(faa1$pitch, faa1$Y, mean, na.rm=TRUE)
+
+table <- round(data.frame(duration, no_pasg, speed_ground , height, pitch),3) %>% 
+  t() %>% as.data.frame()
+
+names(table) <- c('Y=1','Y=2','Y=3')
+table$variable <- rownames(table)
+rownames(table) <- NULL
+
+table <- select(table, variable, everything())
+table
+```
+
+
+1. A one-unit increase in speed_ground
+ - increases the odds of Y=2 by 1.26 relative to Y=1
+
+ - increases the odds of Y=3 by 2.75 relative to Y=1
+
+2. A one-unit increase in height
+ - increases the odds of Y=2 by 1.16 relative to Y=1
+
+ - increases the odds of Y=3 by 1.41 relative to Y=1
+
+3. When looking at Boeing aircraft as compared to Airbus,
+ - odds of Y=2 increases by 47 relative to Y=1
+
+ - odds of Y=3 increases by 9989 relative to Y=1
+
+4. Aircraft, speed of ground, and height are the final vairables that I obtained.
+
+5. There is a significant increase in speed of ground with distance.
+
+```{r}
+ggplot(faa1 , aes(x = Y, y = speed_ground)) +
+  geom_boxplot()
+```
+
+6. There is a slight increase in the height of aircraft as distance increases.
+
+```{r}
+ggplot(faa1 , aes(x = Y, y = height)) +
+  geom_boxplot()
+```
